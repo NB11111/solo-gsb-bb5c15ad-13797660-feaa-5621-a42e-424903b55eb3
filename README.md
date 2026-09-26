@@ -15,7 +15,10 @@
 按 `(text, speaker)` 在原稿与修订稿间求最长保序匹配，命中词沿用原时间、
 未命中修订词在相邻锚点间隔内均分时间，以及**访谈问答索引**接口，把相邻
 同一说话人的词合并为发言轮次，识别以问号结尾的提问，在其他说话人、始于
-问题结束后且间隔受限的回答中做保序一对一配对，生成可回听的问答索引。
+问题结束后且间隔受限的回答中做保序一对一配对，生成可回听的问答索引，
+以及**响度增益规划**接口，为按时间排列且互不重叠的测量帧在真峰不削波与
+相邻增益爬坡步长的硬约束下，选出响度偏差与增益变化代价之和最小、
+同分取字典序最小的逐帧整数增益。
 基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
@@ -38,6 +41,7 @@ docker compose up --build
 - 叠话统计报告接口：`POST http://localhost:8000/crosstalk-report`
 - 修订稿重对齐逐词时间接口：`POST http://localhost:8000/transcript-retime`
 - 访谈问答索引接口：`POST http://localhost:8000/qa-pairs`
+- 响度增益规划接口：`POST http://localhost:8000/gain-plan`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -1111,16 +1115,114 @@ curl -s http://localhost:8000/qa-pairs \
 {"pairs": [], "unpaired_question_start_words": []}
 ```
 
+## 响度增益规划：`POST /gain-plan`
+
+为 **1～300** 个按时间排列且互不重叠的测量帧逐帧选择 **-12～12 的整数 dB
+增益**，在**真峰不削波**与**相邻增益爬坡步长**两个硬约束下，使响度偏差与
+增益变化代价之和最小；同分时取增益序列字典序最小的方案。
+
+服务地址：`POST http://localhost:8000/gain-plan`
+
+```json
+{
+  "frames": [
+    {"start_ms": 0,    "end_ms": 1000, "loudness_lufs": -20, "true_peak_dbfs": -2},
+    {"start_ms": 1000, "end_ms": 2000, "loudness_lufs": -25, "true_peak_dbfs": -6},
+    {"start_ms": 2000, "end_ms": 3000, "loudness_lufs": -18, "true_peak_dbfs": -1}
+  ],
+  "target_lufs": -16,
+  "max_step_db": 3
+}
+```
+
+字段说明：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `frames` | 非空数组，1～300 帧 | 按时间排列且互不重叠的测量帧（端点相接允许） |
+| `frames[].start_ms` | 非负整数 | 帧起始时间（毫秒） |
+| `frames[].end_ms` | 非负整数 | 帧结束时间（毫秒，须**严格晚于** `start_ms`） |
+| `frames[].loudness_lufs` | 整数，-80～0 | 帧综合响度（LUFS，整数 dB） |
+| `frames[].true_peak_dbfs` | 整数，-80～0 | 帧真峰（dBFS，整数 dB） |
+| `target_lufs` | 整数，-40～0 | 目标响度（LUFS，整数 dB） |
+| `max_step_db` | 整数，0～12 | 相邻帧增益差绝对值的上限（整数 dB） |
+
+### 增益规则
+
+对每帧 i 选择整数增益 g_i ∈ [-12, 12]，须同时满足：
+
+1. **真峰不削波**：`true_peak_dbfs_i + g_i <= 0`（即 `g_i <= -true_peak_dbfs_i`，
+   真峰为 0 dBFS 的帧只允许非正增益，真峰 -80 的帧允许全部 -12～12）；
+2. **爬坡步长**：`|g_i - g_{i-1}| <= max_step_db`；`max_step_db = 0` 时
+   全部帧增益必须相同；
+3. **目标**：最小化总成本
+
+   ```
+   Σ_i |loudness_lufs_i + g_i - target_lufs|   （各帧响度绝对偏差）
+   + 2 × Σ_{i>=1} |g_i - g_{i-1}|              （相邻增益绝对变化量）
+   ```
+
+4. **同分裁决**：总成本相同时，取整条增益序列**字典序最小**者（-12 < -11
+   < … < 12，逐帧比较）。
+
+### 响应示例（200）
+
+```json
+{
+  "frames": [
+    {"index": 0, "start_ms": 0,    "end_ms": 1000, "gain_db": 1},
+    {"index": 1, "start_ms": 1000, "end_ms": 2000, "gain_db": 1},
+    {"index": 2, "start_ms": 2000, "end_ms": 3000, "gain_db": 1}
+  ],
+  "total_cost": 12
+}
+```
+
+> `frames` 按输入顺序返回，`index` 为 0-based 帧序号，`start_ms`/`end_ms`
+> 与输入一致，`gain_db` 为该帧应用的整数增益（-12～12）。
+> 上例三帧各自最贴近目标 -16 LUFS 的“理想增益”为 4/-1/6 dB，但帧 0 真峰
+> -2 dBFS 把增益限制在 ≤2，且变化代价（每 dB 计 2 分）使大幅爬坡并不划算：
+> 三帧同取 1 dB 时偏差为 3+8+1=12、无变化代价，即最优总成本 12。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/gain-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"frames":[{"start_ms":0,"end_ms":1000,"loudness_lufs":-20,"true_peak_dbfs":-2},{"start_ms":1000,"end_ms":2000,"loudness_lufs":-25,"true_peak_dbfs":-6},{"start_ms":2000,"end_ms":3000,"loudness_lufs":-18,"true_peak_dbfs":-1}],"target_lufs":-16,"max_step_db":3}'
+```
+
+### 非法输入
+
+帧数为空或超过 300、`loudness_lufs`/`true_peak_dbfs` 超出 -80～0、
+`target_lufs` 超出 -40～0、`max_step_db` 超出 0～12、字段缺失或非整数等
+结构问题返回 422（`invalid_request`）；帧时间为负、`end_ms <= start_ms`、
+帧间倒序或重叠则分别返回 `invalid_time_range` / `time_out_of_order` /
+`overlapping_time_range`（携带 `frame_index`，0-based）：
+
+```json
+{
+  "error": {
+    "code": "overlapping_time_range",
+    "message": "第 1 帧的 start_ms(900) 早于前一帧的 end_ms(1000)，相邻帧时间不允许重叠",
+    "frame_index": 1
+  }
+}
+```
+
+> 合法输入下必有可行解：全部帧取 -12 时，`true_peak_dbfs - 12 <= 0` 恒成立
+> （真峰 ≥ -80），相邻增益差为 0，故不存在“无可行方案”的 422。
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负；`/transcript-retime` 的 `words`/`revisions` 为空或超过 300 个、修订项缺 `text`/`speaker` 或为空字符串；`/qa-pairs` 的 `words` 超过 300 个、`max_gap_ms` 缺失/为负/非整数） | `errors` |
-| `invalid_time_range` | 某个词 `end_ms < start_ms`（`/crosstalk-report` 中 `word_index` 为输入序） | `word_index` |
-| `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
-| `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负；`/transcript-retime` 的 `words`/`revisions` 为空或超过 300 个、修订项缺 `text`/`speaker` 或为空字符串；`/qa-pairs` 的 `words` 超过 300 个、`max_gap_ms` 缺失/为负/非整数；`/gain-plan` 的 `frames` 为空/超过 300 个、`loudness_lufs`/`true_peak_dbfs` 超出 -80～0、`target_lufs` 超出 -40～0、`max_step_db` 缺失/超出 0～12） | `errors` |
+| `invalid_time_range` | 某个词 `end_ms < start_ms`（`/crosstalk-report` 中 `word_index` 为输入序）；`/gain-plan` 中帧 `start_ms` 为负或 `end_ms <= start_ms`（附加字段为 `frame_index`） | `word_index` 或 `frame_index` |
+| `time_out_of_order` | 相邻词 `start_ms` 倒序；`/gain-plan` 中为相邻帧（附加字段为 `frame_index`） | `word_index` 或 `frame_index` |
+| `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠）；`/gain-plan` 中为相邻帧（附加字段为 `frame_index`） | `word_index` 或 `frame_index` |
 | `infeasible_segmentation` | 不存在满足全部约束的分段 | `last_word_index` |
 | `infeasible_ad_breaks` | 不存在满足全部约束的插播方案 | `break_count`、`candidate_count` |
 | `lock_index_out_of_range` | 锁定词序号越界（含负数） | `word_index` |
@@ -1274,6 +1376,16 @@ E 为不同边界时刻数 ≤ 2n、M 为输出段数 ≤ E、k 为活跃说话�
 （问题首词序号, 回答首词序号）字典序最小的可行首对，归纳可得整条配对序列
 字典序最小；未入选的提问首词序号按升序作为未配对列表返回。
 
+响度增益规划（`gain_plan.py`）为后向 DP + 贪心重建，
+**O(n·25²) 时间、O(n·25) 空间**（n ≤ 300）。每帧合法增益为连续区间
+[-12, -true_peak_dbfs_i]，至多 25 个取值；`bwd[i][g]` 表示帧 i 取 g 时
+后缀 [i, n) 的最小成本（本帧响度偏差 + 到下一帧的 2|g-h| 变化代价 +
+后缀最优），某些高增益状态因爬坡后无法进入后续帧的真峰区间而不可达
+（记 INF，且全 -12 恒可行故至少存在一条完整解）；重建时从帧 0 起在
+合法增益区间内由小到大枚举，取第一个满足爬坡约束且“到前帧变化代价 +
+bwd[i][g]”恰等于剩余最优成本的增益，再把剩余成本更新为
+`bwd[i][g] - 本帧偏差`，归纳可得整条增益序列字典序最小。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -1306,6 +1418,7 @@ app/
   crosstalk_report.py   # 叠话统计报告（纯标准库，允许乱序与交叠，仅校验词内时间）
   transcript_retime.py  # 修订稿重对齐逐词时间（纯标准库，LCS 匹配 + 锚点间隔均分）
   qa_pairs.py           # 访谈问答索引（纯标准库，轮次合并 + 保序一对一配对 DP）
+  gain_plan.py          # 响度增益规划（纯标准库，后向 DP + 贪心重建）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -1320,6 +1433,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_crosstalk_report.py
   test_transcript_retime.py
   test_qa_pairs.py
+  test_gain_plan.py
   test_differential.py
   test_api.py
 Dockerfile

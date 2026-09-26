@@ -1331,5 +1331,150 @@ class QaPairsApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class GainPlanApiTests(unittest.TestCase):
+    FRAMES = [
+        {"start_ms": 0,    "end_ms": 1000, "loudness_lufs": -20, "true_peak_dbfs": -2},
+        {"start_ms": 1000, "end_ms": 2000, "loudness_lufs": -25, "true_peak_dbfs": -6},
+        {"start_ms": 2000, "end_ms": 3000, "loudness_lufs": -18, "true_peak_dbfs": -1},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"frames": self.FRAMES, "target_lufs": -16, "max_step_db": 3}
+        payload.update(overrides)
+        return self.client.post("/gain-plan", json=payload)
+
+    def test_basic_gain_plan(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        # 三帧理想增益 4/-1/6 受真峰与步长限制；与核心实现一致：全 1，
+        # 偏差 |-20+1+16|=3、|-25+1+16|=8、|-18+1+16|=1，总成本 12
+        self.assertEqual(data["total_cost"], 12)
+        self.assertEqual(
+            data["frames"],
+            [
+                {"index": 0, "start_ms": 0,    "end_ms": 1000, "gain_db": 1},
+                {"index": 1, "start_ms": 1000, "end_ms": 2000, "gain_db": 1},
+                {"index": 2, "start_ms": 2000, "end_ms": 3000, "gain_db": 1},
+            ],
+        )
+
+    def test_true_peak_respected(self):
+        frames = [
+            {"start_ms": 0, "end_ms": 100, "loudness_lufs": -40, "true_peak_dbfs": 0},
+            {"start_ms": 100, "end_ms": 200, "loudness_lufs": -40, "true_peak_dbfs": 0},
+        ]
+        resp = self.post(frames=frames, target_lufs=0, max_step_db=12)
+        self.assertEqual(resp.status_code, 200)
+        gains = [f["gain_db"] for f in resp.json()["frames"]]
+        self.assertTrue(all(g <= 0 for g in gains))
+
+    def test_step_zero(self):
+        resp = self.post(max_step_db=0)
+        self.assertEqual(resp.status_code, 200)
+        gains = [f["gain_db"] for f in resp.json()["frames"]]
+        self.assertEqual(len(set(gains)), 1)
+
+    def test_single_frame(self):
+        resp = self.post(frames=[self.FRAMES[0]])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(len(data["frames"]), 1)
+        # 理想增益 4 被真峰 -2 截到 2，偏差 |-20+2+16|=2
+        self.assertEqual(data["frames"][0]["gain_db"], 2)
+        self.assertEqual(data["total_cost"], 2)
+
+    def test_touching_endpoints_allowed(self):
+        frames = [
+            {"start_ms": 0, "end_ms": 100, "loudness_lufs": -20, "true_peak_dbfs": -5},
+            {"start_ms": 100, "end_ms": 200, "loudness_lufs": -20, "true_peak_dbfs": -5},
+        ]
+        resp = self.post(frames=frames)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_invalid_time_range(self):
+        frames = [
+            {"start_ms": 100, "end_ms": 100, "loudness_lufs": -20, "true_peak_dbfs": -5},
+        ]
+        resp = self.post(frames=frames)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_time_range")
+
+    def test_out_of_order_rejected(self):
+        frames = [
+            {"start_ms": 200, "end_ms": 300, "loudness_lufs": -20, "true_peak_dbfs": -5},
+            {"start_ms": 0, "end_ms": 100, "loudness_lufs": -20, "true_peak_dbfs": -5},
+        ]
+        resp = self.post(frames=frames)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_overlap_rejected(self):
+        frames = [
+            {"start_ms": 0, "end_ms": 200, "loudness_lufs": -20, "true_peak_dbfs": -5},
+            {"start_ms": 100, "end_ms": 300, "loudness_lufs": -20, "true_peak_dbfs": -5},
+        ]
+        resp = self.post(frames=frames)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "overlapping_time_range")
+
+    def test_schema_validation(self):
+        # frames 为空 / 超过 300
+        resp = self.post(frames=[])
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        big = [
+            {"start_ms": i * 10, "end_ms": i * 10 + 9,
+             "loudness_lufs": -20, "true_peak_dbfs": -5}
+            for i in range(301)
+        ]
+        resp = self.post(frames=big)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        # 响度/峰值越界
+        for field, bad in (("loudness_lufs", -81), ("true_peak_dbfs", 1)):
+            frame = dict(self.FRAMES[0])
+            frame[field] = bad
+            resp = self.post(frames=[frame])
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        # target 越界、step 越界或缺失
+        for overrides in (
+            {"target_lufs": -41},
+            {"target_lufs": 1},
+            {"max_step_db": -1},
+            {"max_step_db": 13},
+            {"frames": self.FRAMES, "target_lufs": -16},  # 缺 max_step_db
+        ):
+            payload = {"frames": self.FRAMES, "target_lufs": -16, "max_step_db": 3}
+            payload.update(overrides)
+            resp = self.client.post("/gain-plan", json=payload)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_300_frames_accepted(self):
+        frames = [
+            {"start_ms": i * 10, "end_ms": i * 10 + 9,
+             "loudness_lufs": -17 if i % 2 else -25,
+             "true_peak_dbfs": -1 if i % 3 else -80}
+            for i in range(300)
+        ]
+        resp = self.post(frames=frames)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()["frames"]), 300)
+
+    def test_segments_still_works(self):
+        words = [
+            {"start_ms": 0, "end_ms": 2000, "text": "第一句。", "speaker": "A"},
+        ]
+        resp = self.client.post("/segments", json={"words": words})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()
