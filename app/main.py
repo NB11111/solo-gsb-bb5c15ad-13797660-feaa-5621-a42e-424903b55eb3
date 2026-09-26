@@ -3,7 +3,8 @@ POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐
 POST /duplicate-passages 重复口播片段检测、POST /redact-preview 敏感短语
 遮罩预览、POST /trailer-plan 预告片片段组合、POST /playback-plan 播放变速
 规划、POST /crosstalk-report 叠话统计报告、POST /transcript-retime 修订稿
-重新对齐逐词时间、POST /qa-pairs 访谈问答可回听索引服务。"""
+重新对齐逐词时间、POST /qa-pairs 访谈问答可回听索引、POST /gain-plan
+响度增益规划服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -14,6 +15,7 @@ from .chapter_align import align_chapters
 from .crosstalk_report import build_crosstalk_report
 from .duplicate_passages import find_duplicate_passages
 from .errors import DomainError
+from .gain_plan import plan_gain
 from .playback_plan import plan_playback
 from .qa_pairs import build_qa_pairs
 from .redact_preview import redact_preview
@@ -26,6 +28,8 @@ from .schemas import (
     CrosstalkReportResponse,
     DuplicatePassagesRequest,
     DuplicatePassagesResponse,
+    GainPlanRequest,
+    GainPlanResponse,
     PlaybackPlanRequest,
     PlaybackPlanResponse,
     QaPairsRequest,
@@ -63,8 +67,9 @@ app = FastAPI(
     "为未匹配修订词在相邻锚点间隔内均分时间，"
     "以及把相邻同一说话人的词合并为发言轮次、"
     "在其他说话人且间隔受限的回答中为每个提问保序一对一配对、"
-    "生成可回听的问答索引。",
-    version="1.10.0",
+    "生成可回听的问答索引；并在峰值安全与相邻增益变化受限下，"
+    "为逐帧响度测量选择命中目标响度且总代价最小的整数 dB 增益序列。",
+    version="1.11.0",
 )
 
 
@@ -98,7 +103,10 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "非负整数 max_duration_ms；/crosstalk-report 的 words 至多 2000 个；"
         "/transcript-retime 另需非空 revisions（每项含非空 text/speaker），"
         "words 与 revisions 各不超过 300 个；/qa-pairs 另需非负整数 "
-        "max_gap_ms，words 不超过 300 个",
+        "max_gap_ms，words 不超过 300 个；/gain-plan 另需 1～300 个 frames"
+        "（每项含非负整数 start_ms/end_ms 且 start_ms < end_ms、"
+        "-80～0 的整数 loudness_lufs/true_peak_dbfs）、"
+        "-40～0 的整数 target_lufs、0～12 的整数 max_step_db",
         {"errors": exc.errors()},
     )
 
@@ -224,3 +232,13 @@ async def create_qa_pairs(request: QaPairsRequest):
         pairs=pairs,
         unpaired_question_start_words=unpaired,
     )
+
+
+@app.post("/gain-plan", response_model=GainPlanResponse)
+async def create_gain_plan(request: GainPlanRequest):
+    frames, total_cost = plan_gain(
+        request.frames,
+        request.target_lufs,
+        request.max_step_db,
+    )
+    return GainPlanResponse(frames=frames, total_cost=total_cost)

@@ -385,3 +385,51 @@ class QaPairsResponse(BaseModel):
     unpaired_question_start_words: list[int] = Field(
         ..., description="未配上回答的提问首词序号（0-based，升序）"
     )
+
+
+class GainFrameIn(BaseModel):
+    start_ms: int = Field(..., ge=0, description="测量帧起始时间（毫秒，非负整数）")
+    end_ms: int = Field(..., ge=0, description="测量帧结束时间（毫秒，须严格大于 start_ms）")
+    loudness_lufs: int = Field(
+        ..., ge=-80, le=0, description="帧积分响度（LUFS，-80～0 的整数）"
+    )
+    true_peak_dbfs: int = Field(
+        ..., ge=-80, le=0, description="帧真峰值（dBTP/dBFS，-80～0 的整数）"
+    )
+
+
+class GainPlanRequest(BaseModel):
+    frames: list[GainFrameIn] = Field(
+        ...,
+        min_length=1,
+        max_length=300,
+        description="按时间排列且互不重叠的测量帧（1～300 个，允许端点相接）",
+    )
+    target_lufs: int = Field(
+        ..., ge=-40, le=0, description="目标响度（LUFS，-40～0 的整数）"
+    )
+    max_step_db: int = Field(
+        ..., ge=0, le=12, description="相邻帧增益差绝对值上限（0～12 的整数 dB）"
+    )
+
+
+class GainFrameOut(BaseModel):
+    index: int
+    gain_db: int = Field(
+        ..., description="该帧增益（-12～12 的整数 dB）"
+    )
+    resulting_loudness_lufs: int = Field(
+        ..., description="增益后响度：loudness_lufs + gain_db"
+    )
+    resulting_true_peak_dbfs: int = Field(
+        ..., description="增益后真峰值：true_peak_dbfs + gain_db（<= 0）"
+    )
+
+
+class GainPlanResponse(BaseModel):
+    frames: list[GainFrameOut] = Field(..., description="逐帧增益（按输入帧顺序）")
+    total_cost: int = Field(
+        ...,
+        description="最小总成本：Σ|loudness_lufs+gain_db-target_lufs| "
+        "+ 2·Σ|相邻 gain_db 之差|",
+    )

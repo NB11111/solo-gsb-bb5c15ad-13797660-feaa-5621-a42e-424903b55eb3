@@ -1331,5 +1331,201 @@ class QaPairsApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class GainPlanApiTests(unittest.TestCase):
+    FRAMES = [
+        {"start_ms": 0, "end_ms": 1000, "loudness_lufs": -14, "true_peak_dbfs": -2},
+        {"start_ms": 1000, "end_ms": 2000, "loudness_lufs": -20, "true_peak_dbfs": -10},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"frames": self.FRAMES, "target_lufs": -16, "max_step_db": 2}
+        payload.update(overrides)
+        return self.client.post("/gain-plan", json=payload)
+
+    def test_basic_gain_plan(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.json(),
+            {
+                "frames": [
+                    {
+                        "index": 0,
+                        "gain_db": -2,
+                        "resulting_loudness_lufs": -16,
+                        "resulting_true_peak_dbfs": -4,
+                    },
+                    {
+                        "index": 1,
+                        "gain_db": -2,
+                        "resulting_loudness_lufs": -22,
+                        "resulting_true_peak_dbfs": -12,
+                    },
+                ],
+                "total_cost": 6,
+            },
+        )
+
+    def test_zero_step_forces_equal_gains(self):
+        resp = self.post(
+            frames=[
+                {"start_ms": 0, "end_ms": 10, "loudness_lufs": -20, "true_peak_dbfs": -10},
+                {"start_ms": 10, "end_ms": 20, "loudness_lufs": -10, "true_peak_dbfs": -10},
+            ],
+            max_step_db=0,
+        )
+        self.assertEqual(resp.status_code, 200)
+        gains = [f["gain_db"] for f in resp.json()["frames"]]
+        self.assertEqual(gains, [-6, -6])  # |g-4|+|g+6| 在 [-6,4] 恒为 10，取字典序最小
+        self.assertEqual(resp.json()["total_cost"], 10)
+
+    def test_peak_safety_result_at_most_zero(self):
+        # 真峰值 0 的帧只能衰减；增益后真峰值必须 <= 0
+        resp = self.post(
+            frames=[
+                {"start_ms": 0, "end_ms": 10, "loudness_lufs": -16, "true_peak_dbfs": 0}
+            ],
+            target_lufs=-14,  # 理想增益 +2 被峰值约束压回 0
+            max_step_db=2,
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["frames"][0]["gain_db"], 0)
+        self.assertEqual(data["frames"][0]["resulting_true_peak_dbfs"], 0)
+        self.assertEqual(data["total_cost"], 2)
+
+    def test_touching_endpoints_allowed(self):
+        # 端点相接（下帧 start == 上帧 end）合法；响度恰为目标时增益 0
+        resp = self.post(
+            frames=[
+                {"start_ms": 0, "end_ms": 100, "loudness_lufs": -16, "true_peak_dbfs": -3},
+                {"start_ms": 100, "end_ms": 200, "loudness_lufs": -16, "true_peak_dbfs": -3},
+            ],
+            target_lufs=-16,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([f["gain_db"] for f in resp.json()["frames"]], [0, 0])
+
+    def test_overlapping_frames_rejected(self):
+        resp = self.post(
+            frames=[
+                {"start_ms": 0, "end_ms": 1000, "loudness_lufs": -14, "true_peak_dbfs": -2},
+                {"start_ms": 500, "end_ms": 1500, "loudness_lufs": -20, "true_peak_dbfs": -10},
+            ]
+        )
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "overlapping_time_range")
+        self.assertEqual(err["frame_index"], 1)
+
+    def test_out_of_order_frames_rejected(self):
+        resp = self.post(
+            frames=[
+                {"start_ms": 1000, "end_ms": 2000, "loudness_lufs": -14, "true_peak_dbfs": -2},
+                {"start_ms": 0, "end_ms": 900, "loudness_lufs": -20, "true_peak_dbfs": -10},
+            ]
+        )
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "time_out_of_order")
+        self.assertEqual(err["frame_index"], 1)
+
+    def test_non_positive_duration_rejected(self):
+        # end_ms == start_ms 由核心校验拒绝（invalid_time_range）；
+        # end_ms 为负数在模型层 ge=0 即被拒（invalid_request）
+        resp = self.post(
+            frames=[
+                {"start_ms": 100, "end_ms": 100, "loudness_lufs": -14, "true_peak_dbfs": -2}
+            ]
+        )
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "invalid_time_range")
+        self.assertEqual(err["frame_index"], 0)
+
+        resp = self.post(
+            frames=[
+                {"start_ms": 0, "end_ms": -100, "loudness_lufs": -14, "true_peak_dbfs": -2}
+            ]
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_value_ranges_enforced(self):
+        bad_payloads = [
+            {"frames": []},
+            {"frames": [
+                {"start_ms": 0, "end_ms": 1, "loudness_lufs": -20, "true_peak_dbfs": -3}
+            ] * 301},
+            {"frames": [
+                {"start_ms": 0, "end_ms": 1, "loudness_lufs": -81, "true_peak_dbfs": -3}
+            ]},
+            {"frames": [
+                {"start_ms": 0, "end_ms": 1, "loudness_lufs": -20, "true_peak_dbfs": 1}
+            ]},
+            {"target_lufs": -41},
+            {"target_lufs": 1},
+            {"max_step_db": -1},
+            {"max_step_db": 13},
+        ]
+        for overrides in bad_payloads:
+            payload = {
+                "frames": [
+                    {"start_ms": 0, "end_ms": 1, "loudness_lufs": -20, "true_peak_dbfs": -3}
+                ],
+                "target_lufs": -20,
+                "max_step_db": 2,
+            }
+            payload.update(overrides)
+            resp = self.client.post("/gain-plan", json=payload)
+            self.assertEqual(resp.status_code, 422, payload)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request", payload)
+
+    def test_integer_only_enforced(self):
+        # 与其他接口一致使用普通 int（Pydantic 默认 lax 模式）：小数值拒绝；
+        # 整数值浮点 -16.0 / 数字字符串会被 lax 模式宽松接受（项目既有约定）
+        for bad in (-16.5, 0.5):
+            resp = self.post(target_lufs=bad)
+            self.assertEqual(resp.status_code, 422, bad)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        for bad in ({"max_step_db": 2.5}, {"frames": [
+            {"start_ms": 0, "end_ms": 1.5, "loudness_lufs": -16, "true_peak_dbfs": -2}
+        ]}):
+            payload = {"frames": self.FRAMES, "target_lufs": -16, "max_step_db": 2}
+            payload.update(bad)
+            resp = self.client.post("/gain-plan", json=payload)
+            self.assertEqual(resp.status_code, 422, bad)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_300_frames_accepted(self):
+        # 300 帧恰好在上限内；帧 [i, i+1) 端点相接，响度恰为目标，全 0 增益
+        frames = [
+            {"start_ms": i, "end_ms": i + 1, "loudness_lufs": -20, "true_peak_dbfs": -3}
+            for i in range(300)
+        ]
+        resp = self.post(frames=frames, target_lufs=-20)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(len(data["frames"]), 300)
+        self.assertEqual(data["total_cost"], 0)
+        self.assertTrue(all(f["gain_db"] == 0 for f in data["frames"]))
+
+    def test_segments_still_works(self):
+        resp = self.client.post(
+            "/segments",
+            json={
+                "words": [
+                    {"start_ms": 0, "end_ms": 2000, "text": "第一句。", "speaker": "A"}
+                ]
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()
